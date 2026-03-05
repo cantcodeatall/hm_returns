@@ -1,3 +1,9 @@
+# Generated financial data — personal, never commit
+hm_staging/
+reports/
+snapshots/
+ReportsTransactionAll.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
