@@ -70,8 +70,8 @@ HM_ACCOUNT3_EMAIL=child@example.com
 HM_ACCOUNT3_PASSWORD=childpassword
 
 # Benchmark ETFs — comma-separated Yahoo Finance tickers
-# Defaults: Global Equities, European Property, Corp Bonds
-ETF_TICKERS=VWRP.L,XDER.L,SLXX.L
+# Defaults: Global Equities, European Property, Global Bonds
+ETF_TICKERS=VWRP.L,XDER.L,VAGS.L
 ```
 
 Accounts with blank credentials are automatically skipped — if you only have two accounts, leave the third block empty.
@@ -134,11 +134,9 @@ The default tickers and what they represent:
 |--------|-------------|
 | `VWRP.L` | Vanguard FTSE All-World — global equities (accumulating) |
 | `XDER.L` | Xtrackers FTSE EPRA/NAREIT — European property (accumulating) |
-| `SLXX.L` | iShares GBP Corp Bond — corporate bonds (distributing) |
+| `VAGS.L` | Vanguard Global Aggregate Bond — global bonds (accumulating) |
 
 To change benchmarks, update `ETF_TICKERS` in your `.env` file. Any Yahoo Finance ticker works.
-
-Note: SLXX is distributing rather than accumulating, which makes the comparison slightly imperfect (distributions are not reinvested in the model).
 
 ---
 
