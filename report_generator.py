@@ -8,13 +8,24 @@ from datetime import datetime
 from pathlib import Path
 
 
-# Friendly display names for known tickers
-TICKER_LABELS = {
-    "VWRP.L": "Global Equities (VWRP)",
-    "XDER.L": "European Property (XDER)",
-    "VCPB.L": "Corp Bonds (VCPB)",
-    "SLXX.L": "Corp Bonds (SLXX)",
-}
+import os
+
+def build_ticker_labels(tickers=None):
+    """
+    Build display-name map from ETF_LABELS env var.
+    Format: VWRP.L=Global Equities (VWRP),XDER.L=European Property (XDER)
+    Falls back to the raw ticker string for anything not listed.
+    """
+    labels = {}
+    for entry in os.getenv("ETF_LABELS", "").split(","):
+        entry = entry.strip()
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            labels[k.strip()] = v.strip()
+    if tickers:
+        for t in tickers:
+            labels.setdefault(t, t)
+    return labels
 
 
 def generate_report(
@@ -30,6 +41,7 @@ def generate_report(
 ):
     total_balance = sum(a["balance"] for a in account_balances)
     now = datetime.now().strftime("%d %B %Y, %H:%M")
+    TICKER_LABELS = build_ticker_labels([b["ticker"] for b in benchmarks])
 
     def fmt_pct(v):
         if v is None:

@@ -185,13 +185,17 @@ def main():
     def fmt_gbp(v):
         return f"{v:.2f}" if v is not None else "N/A"
 
-    # ── Ticker display names ──────────────────────────────────────────────────
-    TICKER_NAMES = {
-        "VWRP.L": "Global Equities (VWRP)",
-        "XDER.L": "European Property (XDER)",
-        "SLXX.L": "Corp Bonds (SLXX)",
-        "VCPB.L": "Corp Bonds (VCPB)",
-    }
+    # ── Ticker display names — built from ETF_LABELS env var ────────────────
+    # Set ETF_LABELS in .env as: VWRP.L=Global Equities (VWRP),XDER.L=European Property (XDER)
+    # Any ticker without a label entry just shows the raw ticker string.
+    TICKER_NAMES = {}
+    for entry in os.getenv("ETF_LABELS", "").split(","):
+        entry = entry.strip()
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            TICKER_NAMES[k.strip()] = v.strip()
+    for t in ETF_TICKERS:
+        TICKER_NAMES.setdefault(t, t)
 
     # ── Build txt content ─────────────────────────────────────────────────────
     lines = []
