@@ -226,14 +226,26 @@ def scrape_account(page, account: dict) -> dict:
         f.write(full_html)
     print(f"  → Full page HTML dumped ({len(full_html):,} bytes) to hm_staging/filter_html_dump.txt")
 
-    # ── 5 & 6. Select "All accounts" via Select2 + Apply ────────────────────
-    # From HTML: the visible trigger is app-select-account .select2-selection--single
-    # Select2 appends its results list to <body> as .select2-results__option
+    # ── 5 & 6. Select "All accounts" via ng-select + Apply ──────────────────
+    # Site updated: dropdown is now Angular ng-select (not Select2).
+    # Trigger: app-select-account .ng-select-container
+    # Options: .ng-option elements in a panel appended to body
 
     APPLY_SEL = 'button:has-text("Apply")'
 
     def kill_uf():
         page.evaluate("""document.querySelectorAll('[class*="uf-"]').forEach(e=>e.style.display='none')""")
+
+    def wait_for_spinner():
+        """Wait until the block-ui loading spinner is gone."""
+        try:
+            page.wait_for_selector(
+                "div.block-ui-wrapper.root.active",
+                state="hidden", timeout=30_000
+            )
+            print("  → Spinner gone")
+        except PlaywrightTimeout:
+            pass  # spinner may never have appeared
 
     def click_apply():
         kill_uf()
@@ -243,41 +255,51 @@ def scrape_account(page, account: dict) -> dict:
             btn.click(timeout=3_000)
         except Exception:
             page.evaluate("el => el.click()", btn)
-        print("  → Apply clicked")
-        page.wait_for_timeout(2_500)
+        print("  → Apply clicked, waiting for spinner...")
+        wait_for_spinner()
         kill_uf()
         try:
-            page.wait_for_selector("table tbody tr", timeout=15_000, state="visible")
+            page.wait_for_selector("table tbody tr", timeout=20_000, state="visible")
             print("  → Table rows visible")
         except PlaywrightTimeout:
             page.wait_for_timeout(2_000)
 
-    def select2_pick(label):
-        """Open the Select2 account dropdown and click the matching option."""
+    def ngselect_pick(label):
+        """Open the ng-select account dropdown and click the matching option."""
         kill_uf()
         trigger = page.wait_for_selector(
-            "app-select-account .select2-selection--single",
+            "app-select-account .ng-select-container",
             timeout=10_000, state="visible"
         )
         trigger.click()
         page.wait_for_timeout(600)
 
-        # Results list is appended to <body> by Select2
+        # ng-select renders options in a panel; try body-level and local
         opt = page.wait_for_selector(
-            f'.select2-results__option:has-text("{label}")',
+            f'.ng-option:has-text("{label}")',
             timeout=5_000, state="visible"
         )
         opt.click()
         page.wait_for_timeout(500)
 
-        shown = page.inner_text("app-select-account .select2-selection__rendered")
-        print(f"  → Select2 now shows: '{shown.strip()}'")
+        try:
+            shown = page.inner_text("app-select-account .ng-value-label")
+            print(f"  → ng-select now shows: '{shown.strip()}'")
+        except Exception:
+            pass
 
-    # Read available options from the hidden <select>
-    opts = page.evaluate("""() => {
-        const sel = document.querySelector('app-select-account select');
-        return sel ? Array.from(sel.options).map(o => o.text.trim()) : [];
-    }""")
+    # Read available options by opening the dropdown briefly
+    kill_uf()
+    trigger = page.wait_for_selector(
+        "app-select-account .ng-select-container",
+        timeout=10_000, state="visible"
+    )
+    trigger.click()
+    page.wait_for_timeout(600)
+    option_els = page.query_selector_all(".ng-option")
+    opts = [el.inner_text().strip() for el in option_els if el.inner_text().strip()]
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(400)
     print(f"  → Account options: {opts}")
 
     all_label = next((o for o in opts if "all" in o.lower()), None)
@@ -288,54 +310,70 @@ def scrape_account(page, account: dict) -> dict:
     else:
         specific = next((o for o in opts if "all" not in o.lower()), opts[0])
         print(f"  → Step 5a: picking '{specific}'")
-        select2_pick(specific)
+        ngselect_pick(specific)
         click_apply()
 
         print(f"  → Step 5b: picking '{all_label}'")
-        select2_pick(all_label)
+        ngselect_pick(all_label)
         click_apply()
 
     print("  → Transactions loaded, ready to export")
 
     # ── 7. Export to CSV ──────────────────────────────────────────────────────
-    # The button triggers an Angular/Blob download — we intercept it by
-    # monkey-patching document.createElement('a') to capture the blob URL
-    # before the browser would normally trigger a file-save dialog.
+    # Wait for spinner to fully clear before exporting
     print("  → Locating Export to CSV button...")
+    wait_for_spinner()
     kill_uf()
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(500)
 
-    # Exact selector from HTML: button with icon-file-excel inside, in app-portfolio-statements
     export_btn = page.wait_for_selector(
         'button:has-text("Export to CSV")',
         timeout=15_000, state="visible"
     )
     print("  → Export button found, injecting blob interceptor...")
 
-    # Inject JS to intercept the blob <a> click that Angular uses for CSV download
+    # Angular/FileSaver creates a blob URL synchronously then immediately revokes it.
+    # We must store the blob SYNCHRONOUSLY inside createObjectURL before it's revoked.
+    # We stash the raw blob bytes via a synchronous FileReaderSync in a Worker,
+    # but since that's complex we instead store the URL and fetch it immediately.
+    # Key: intercept BOTH createObjectURL and the <a>.click, storing blob ref directly.
     page.evaluate("""() => {
-        window.__blobData = null;
-        const origCreate = document.createElement.bind(document);
+        window.__blobData   = null;
+        window.__blobRef    = null;
+
+        // Intercept URL.createObjectURL — store the blob object itself synchronously
+        const origCreate = URL.createObjectURL.bind(URL);
+        URL.createObjectURL = function(blob) {
+            window.__blobRef = blob;           // store blob synchronously
+            const url = origCreate(blob);
+            return url;
+        };
+
+        // Intercept <a>.click to catch the download trigger and read the blob
+        const origCreateEl = document.createElement.bind(document);
         document.createElement = function(tag) {
-            const el = origCreate(tag);
+            const el = origCreateEl(tag);
             if (tag.toLowerCase() === 'a') {
                 const origClick = el.click.bind(el);
                 el.click = function() {
-                    if (el.href && el.href.startsWith('blob:')) {
-                        window.__blobHref = el.href;
-                        window.__blobFilename = el.download || 'export.csv';
-                        // Fetch the blob and store as base64
+                    // Try reading from stored blob ref first
+                    const blob = window.__blobRef;
+                    if (blob) {
+                        const reader = new FileReader();
+                        reader.onloadend = () => { window.__blobData = reader.result; };
+                        reader.readAsDataURL(blob);
+                    } else if (el.href && el.href.startsWith('blob:')) {
+                        // Fallback: fetch the URL before it's revoked
                         fetch(el.href)
                             .then(r => r.blob())
-                            .then(blob => {
+                            .then(b => {
                                 const reader = new FileReader();
-                                reader.onloadend = () => {
-                                    window.__blobData = reader.result;
-                                };
-                                reader.readAsDataURL(blob);
+                                reader.onloadend = () => { window.__blobData = reader.result; };
+                                reader.readAsDataURL(b);
                             });
-                        return; // prevent the native save dialog
                     }
+                    // Still call origClick so Angular's cleanup runs normally
+                    // but we've already captured the data
                     return origClick();
                 };
             }
@@ -343,14 +381,12 @@ def scrape_account(page, account: dict) -> dict:
         };
     }""")
 
-    # Click the button — Angular will call createElement('a') + .click() internally
     export_btn.click(force=True)
     print("  → Export clicked, waiting for blob data...")
 
-    # Poll for the blob data (up to 60s)
     import time, base64
     blob_data = None
-    for i in range(120):
+    for i in range(60):   # 30s should be plenty now the blob is captured synchronously
         result = page.evaluate("() => window.__blobData")
         if result:
             blob_data = result
@@ -362,13 +398,12 @@ def scrape_account(page, account: dict) -> dict:
     csv_path = STAGING_DIR / f"{name.replace(' ', '_')}_transactions.csv"
 
     if blob_data:
-        # blob_data is a data URL: "data:text/csv;base64,..."
         print("  → Blob intercepted, saving file...")
         header, encoded = blob_data.split(",", 1)
         csv_bytes = base64.b64decode(encoded)
         csv_path.write_bytes(csv_bytes)
     else:
-        # Blob interceptor didn't fire — fall back to standard Playwright download
+        # Nothing captured — try Playwright native download as last resort
         print("  → Blob interceptor got nothing, trying standard download fallback...")
         try:
             with page.expect_download(timeout=30_000) as dl:
