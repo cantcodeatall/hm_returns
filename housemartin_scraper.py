@@ -326,92 +326,80 @@ def scrape_account(page, account: dict) -> dict:
     kill_uf()
     page.wait_for_timeout(500)
 
-    export_btn = page.wait_for_selector(
-        'button:has-text("Export to CSV")',
-        timeout=15_000, state="visible"
-    )
-    print("  → Export button found, injecting blob interceptor...")
+    import time, base64
 
-    # Angular/FileSaver creates a blob URL synchronously then immediately revokes it.
-    # We must store the blob SYNCHRONOUSLY inside createObjectURL before it's revoked.
-    # We stash the raw blob bytes via a synchronous FileReaderSync in a Worker,
-    # but since that's complex we instead store the URL and fetch it immediately.
-    # Key: intercept BOTH createObjectURL and the <a>.click, storing blob ref directly.
-    page.evaluate("""() => {
-        window.__blobData   = null;
-        window.__blobRef    = null;
-
-        // Intercept URL.createObjectURL — store the blob object itself synchronously
-        const origCreate = URL.createObjectURL.bind(URL);
+    BLOB_JS = """() => {
+        window.__blobData = null;
+        window.__blobRef  = null;
+        const origCreateURL = URL.createObjectURL.bind(URL);
         URL.createObjectURL = function(blob) {
-            window.__blobRef = blob;           // store blob synchronously
-            const url = origCreate(blob);
-            return url;
+            window.__blobRef = blob;
+            return origCreateURL(blob);
         };
-
-        // Intercept <a>.click to catch the download trigger and read the blob
         const origCreateEl = document.createElement.bind(document);
         document.createElement = function(tag) {
             const el = origCreateEl(tag);
             if (tag.toLowerCase() === 'a') {
                 const origClick = el.click.bind(el);
                 el.click = function() {
-                    // Try reading from stored blob ref first
                     const blob = window.__blobRef;
                     if (blob) {
                         const reader = new FileReader();
                         reader.onloadend = () => { window.__blobData = reader.result; };
                         reader.readAsDataURL(blob);
                     } else if (el.href && el.href.startsWith('blob:')) {
-                        // Fallback: fetch the URL before it's revoked
-                        fetch(el.href)
-                            .then(r => r.blob())
-                            .then(b => {
-                                const reader = new FileReader();
-                                reader.onloadend = () => { window.__blobData = reader.result; };
-                                reader.readAsDataURL(b);
-                            });
+                        fetch(el.href).then(r => r.blob()).then(b => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => { window.__blobData = reader.result; };
+                            reader.readAsDataURL(b);
+                        });
                     }
-                    // Still call origClick so Angular's cleanup runs normally
-                    // but we've already captured the data
                     return origClick();
                 };
             }
             return el;
         };
-    }""")
-
-    export_btn.click(force=True)
-    print("  → Export clicked, waiting for blob data...")
-
-    import time, base64
-    blob_data = None
-    for i in range(60):   # 30s should be plenty now the blob is captured synchronously
-        result = page.evaluate("() => window.__blobData")
-        if result:
-            blob_data = result
-            break
-        time.sleep(0.5)
-        if i % 10 == 9:
-            print(f"  → Still waiting... ({(i+1)//2}s)")
+    }"""
 
     csv_path = STAGING_DIR / f"{name.replace(' ', '_')}_transactions.csv"
+    blob_data = None
+
+    for attempt in range(1, 4):   # up to 3 attempts
+        print(f"  → Export attempt {attempt}/3 — injecting blob interceptor...")
+
+        export_btn = page.wait_for_selector(
+            'button:has-text("Export to CSV")',
+            timeout=15_000, state="visible"
+        )
+
+        # Re-inject interceptor fresh each attempt (resets __blobData)
+        page.evaluate(BLOB_JS)
+        page.wait_for_timeout(300)   # brief pause so patch is in place before click
+
+        export_btn.click(force=True)
+        print(f"  → Export clicked, waiting for blob data...")
+
+        for i in range(60):   # poll up to 30s
+            result = page.evaluate("() => window.__blobData")
+            if result:
+                blob_data = result
+                break
+            time.sleep(0.5)
+            if i % 10 == 9:
+                print(f"  → Still waiting... ({(i+1)//2}s)")
+
+        if blob_data:
+            break
+        print(f"  ⚠  Attempt {attempt} got no blob data, retrying...")
+        page.wait_for_timeout(2_000)
 
     if blob_data:
         print("  → Blob intercepted, saving file...")
         header, encoded = blob_data.split(",", 1)
-        csv_bytes = base64.b64decode(encoded)
-        csv_path.write_bytes(csv_bytes)
+        csv_path.write_bytes(base64.b64decode(encoded))
     else:
-        # Nothing captured — try Playwright native download as last resort
-        print("  → Blob interceptor got nothing, trying standard download fallback...")
-        try:
-            with page.expect_download(timeout=30_000) as dl:
-                export_btn.click(force=True)
-            dl.value.save_as(str(csv_path))
-        except PlaywrightTimeout:
-            save_debug_screenshot(page, name, "export_fallback")
-            raise RuntimeError(f"Export failed for {name} — no blob data and no download event")
+        save_debug_screenshot(page, name, "export_fallback")
+        raise RuntimeError(f"Export failed for {name} after 3 attempts — no blob data captured")
 
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         raise RuntimeError(f"CSV file empty or missing: {csv_path}")
