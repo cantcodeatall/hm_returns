@@ -3,13 +3,16 @@ import glob
 import os
 import sys
 
-def merge_csv_files(input_path=None, output_file='ReportsTransactionAll.csv', current_value=None):
+def merge_csv_files(input_path=None, output_file='ReportsTransactionAll.csv', current_value=None, single_file=None):
     # If no input path is provided, use the current script location
     if input_path is None:
         input_path = os.path.dirname(os.path.abspath(__file__))
     
-    # Use glob to get all CSV files in the specified directory
-    all_files = glob.glob(os.path.join(input_path, "*.csv"))
+    # single_file overrides glob — used for sub-account merges
+    if single_file:
+        all_files = [single_file]
+    else:
+        all_files = glob.glob(os.path.join(input_path, "*.csv"))
     
     # Create an empty list to store individual dataframes
     df_list = []

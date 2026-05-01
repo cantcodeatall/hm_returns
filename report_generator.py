@@ -35,8 +35,10 @@ def generate_report(
     current_value,
     pnl,
     total_return,
-    benchmarks: list,       # [{"ticker", "irr", "pnl", "final_value", "total_return"}, ...]
+    benchmarks: list,
     account_balances: list,
+    sub_accounts: list = None,
+    hmfund_nav       = None,
     output_path: str = "housemartin_report.html",
 ):
     total_balance = sum(a["balance"] for a in account_balances)
@@ -81,6 +83,32 @@ def generate_report(
         for a in account_balances
     )
 
+    # ── Sub-account rows ───────────────────────────────────────────────────────
+    def fmt_irr(v):
+        return f"{v*100:.2f}%" if v is not None else "N/A"
+
+    sub_account_rows = ""
+    if sub_accounts:
+        for sa in sub_accounts:
+            irr_val   = fmt_irr(sa.get("irr"))
+            cv_val    = fmt_gbp(sa.get("current_value"))
+            pnl_val   = fmt_gbp(sa.get("pnl"))
+            ret_val   = fmt_pct(sa.get("total_return"))
+            inv_val   = fmt_gbp(sa.get("gross_investment"))
+            cash_val  = fmt_gbp(sa.get("cash"))
+            sc        = sign_class(sa.get("pnl"))
+            sub_account_rows += f"""
+      <tr>
+        <td>{sa["holder"]}</td>
+        <td>{sa["label"]}</td>
+        <td class="num">{inv_val}</td>
+        <td class="num">{cash_val}</td>
+        <td class="num">{cv_val}</td>
+        <td class="num {sc}">{pnl_val}</td>
+        <td class="num {sc}">{ret_val}</td>
+        <td class="num gold"><strong>{irr_val}</strong></td>
+      </tr>"""
+
     irr_pct = f"{irr_result * 100:.2f}%" if irr_result is not None else "N/A"
 
     # ── Benchmark cards ───────────────────────────────────────────────────────
@@ -116,6 +144,29 @@ def generate_report(
         </div>"""
 
     benchmark_cards_html = "\n".join(benchmark_card(b) for b in benchmarks)
+
+    if sub_accounts and sub_account_rows:
+        sub_account_section = f"""  <section class="full">
+    <h2>Sub-Account Breakdown</h2>
+    <table class="sub-account-table">
+      <thead>
+        <tr>
+          <th>Account Holder</th>
+          <th>Account Type</th>
+          <th class="num">Invested</th>
+          <th class="num">Cash</th>
+          <th class="num">Total Value</th>
+          <th class="num">P&amp;L</th>
+          <th class="num">Total Return</th>
+          <th class="num">XIRR</th>
+        </tr>
+      </thead>
+      <tbody>{sub_account_rows}
+      </tbody>
+    </table>
+  </section>"""
+    else:
+        sub_account_section = ""
 
     # ── Outperformance banner items ───────────────────────────────────────────
     def banner(b):
@@ -233,6 +284,20 @@ def generate_report(
     text-transform: uppercase;
     color: var(--muted);
   }}
+  .xirr-hero-inner {{
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 2rem;
+  }}
+  .hero-nav {{
+    text-align: right;
+    border-left: 1px solid var(--rule);
+    padding-left: 2rem;
+  }}
+  .hero-nav .hero-number {{
+    font-size: 3.8rem;
+  }}
 
   table {{ width: 100%; border-collapse: collapse; }}
   td {{ padding: 0.5rem 0; }}
@@ -311,6 +376,10 @@ def generate_report(
   }}
 
   .account-table td:first-child {{ color: var(--ink); }}
+  .sub-account-table th {{ color: var(--muted); font-size: 0.65rem; letter-spacing: 0.1em; text-transform: uppercase; padding-bottom: 0.6rem; text-align: left; border-bottom: 1px solid var(--rule); }}
+  .sub-account-table th.num {{ text-align: right; }}
+  .sub-account-table td {{ padding: 0.45rem 0; }}
+  .sub-account-table td:first-child, .sub-account-table td:nth-child(2) {{ color: var(--ink); }}
   .pos  {{ color: var(--green); }}
   .neg  {{ color: var(--red); }}
   .gold {{ color: var(--gold); }}
@@ -352,9 +421,16 @@ def generate_report(
 
   <!-- XIRR hero — most important figure, shown first full-width -->
   <section class="full xirr-hero">
-    <h2>Annualised Return (XIRR)</h2>
-    <div class="hero-number {sign_class(irr_result)} gold">{irr_pct}</div>
-    <div class="hero-label">{fmt_time(time_difference)} value-weighted avg hold · {fmt_gbp(net_investment)} net invested</div>
+    <div class="xirr-hero-inner">
+      <div>
+        <div class="hero-label">Annualised Return (XIRR)</div>
+        <div class="hero-number {sign_class(irr_result)} gold">{irr_pct}</div>
+      </div>
+      {f'''<div class="hero-nav">
+        <div class="hero-label">HMFUND NAV</div>
+        <div class="hero-number gold">{hmfund_nav:.4f}</div>
+      </div>''' if hmfund_nav else ""}
+    </div>
   </section>
 
   <!-- Portfolio summary + account breakdown side by side -->
@@ -369,7 +445,7 @@ def generate_report(
           <td class="num {sign_class(pnl)}">{fmt_gbp(pnl)}</td></tr>
       <tr><td>Total Return</td>
           <td class="num {sign_class(total_return)}">{fmt_pct(total_return)}</td></tr>
-      <tr><td>Avg time held</td>
+      <tr><td>Value-weighted avg hold</td>
           <td class="num">{fmt_time(time_difference)}</td></tr>
     </table>
   </section>
@@ -384,6 +460,8 @@ def generate_report(
       </tr>
     </table>
   </section>
+
+  {sub_account_section}
 
   <section class="full">
     <h2>Benchmark Comparisons</h2>

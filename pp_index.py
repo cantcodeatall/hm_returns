@@ -1,0 +1,725 @@
+"""
+pp_index.py  —  Housemartin → Portfolio Performance data builder
+================================================================
+NAV is computed by chain-linking, stripping out external cash flows:
+
+    CF_t     = NI_t - NI_{t-1}
+    units_t  = units_{t-1} + CF_t / NAV_{t-1}
+    NAV_t    = Value_t / units_t
+
+This is the standard fund NAV formula — performance-only, immune to
+deposit/withdrawal size effects.
+
+Starting point: 2023-08-30, NAV=100.0, units = Value/100 = 7594.46
+
+Outputs (local CSV + Google Sheets):
+  hmfund_quotes.csv          — Date;Close
+  hmfund_transactions_seed.csv — Date;Type;Value;Shares;Quote;Account;Portfolio
+  hm_pp_state.json           — running state for daily incremental updates
+"""
+
+import os, sys, re, json
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+from gsheets import _get_service, SHEET_ID
+
+STARTING_NAV   = 100.0
+STARTING_DATE  = pd.Timestamp("2023-01-01")
+SPLIT_DATE     = pd.Timestamp("2026-03-14")  # first date with per-account data in hm_history.csv
+STATE_FILE   = HERE / "hm_pp_state.json"
+QUOTES_FILE  = HERE / "hmfund_quotes.csv"
+TXN_FILE     = HERE / "hmfund_transactions_seed.csv"
+
+# ACCOUNTS — one entry per sub-account.
+# Keys must match the acc_key pattern used in run.py (holder_subtype).
+# Each entry needs:
+#   securities_account — name of the PP securities account
+#   hist_val           — column name in hm_history.csv for this account's value
+#   hist_xirr          — column name in hm_history.csv for this account's XIRR
+#   csv_file           — filename of the per-account CSV in hm_staging/
+#   pp_account         — same as securities_account (kept for legacy compatibility)
+#   pp_cash            — deposit account name in PP (can match securities_account)
+ACCOUNTS = {
+    "acc1_reg": {"securities_account": "Acc1 HM Reg", "hist_val": "acc1_reg_final_value",
+                 "hist_xirr": "acc1_reg_XIRR", "csv_file": "acc1_regular_acc.csv",
+                 "pp_account": "Acc1 HM Reg", "pp_cash": "Acc1 HM Reg (GBP)"},
+    "acc1_isa": {"securities_account": "Acc1 HM ISA", "hist_val": "acc1_ISA_final_value",
+                 "hist_xirr": "acc1_ISA_XIRR", "csv_file": "acc1_isa_acc.csv",
+                 "pp_account": "Acc1 HM ISA", "pp_cash": "Acc1 HM ISA (GBP)"},
+    "acc2_reg": {"securities_account": "Acc2 HM Reg", "hist_val": "acc2_reg_final_value",
+                 "hist_xirr": "acc2_reg_XIRR", "csv_file": "acc2_regular_acc.csv",
+                 "pp_account": "Acc2 HM Reg", "pp_cash": "Acc2 HM Reg (GBP)"},
+    "acc2_isa": {"securities_account": "Acc2 HM ISA", "hist_val": "acc2_ISA_final_value",
+                 "hist_xirr": "acc2_ISA_XIRR", "csv_file": "acc2_isa_acc.csv",
+                 "pp_account": "Acc2 HM ISA", "pp_cash": "Acc2 HM ISA (GBP)"},
+    "acc3_reg": {"securities_account": "Acc3 HM Reg", "hist_val": "acc3_reg_final_value",
+                 "hist_xirr": "acc3_reg_XIRR", "csv_file": "acc3_regular_acc.csv",
+                 "pp_account": "Acc3 HM Reg", "pp_cash": "Acc3 HM Reg (GBP)"},
+}
+
+HMFUND_ISIN   = "XX000HM00001"
+HMFUND_TICKER = "HM"
+
+
+# ── 1. Parse data sources ─────────────────────────────────────────────────────
+
+def parse_snapshots_txt(path: Path) -> pd.DataFrame:
+    rows = []
+    cur_date = cur_val = cur_ni = None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            m = re.match(r'^(\d{4}-\d{2}-\d{2})$', line)
+            if m:
+                if cur_date and cur_val is not None:
+                    rows.append({"date": pd.Timestamp(cur_date),
+                                 "value": cur_val, "net_invested": cur_ni})
+                cur_date = m.group(1); cur_val = cur_ni = None
+            m2 = re.search(r'(?:Final Value|Current Value)\s*[:\s]+([0-9,]+\.?\d*)', line)
+            if m2: cur_val = float(m2.group(1).replace(",",""))
+            m3 = re.search(r'Net Investment\s*[:\s]+([0-9,]+\.?\d*)', line)
+            if m3: cur_ni  = float(m3.group(1).replace(",",""))
+    if cur_date and cur_val is not None:
+        rows.append({"date": pd.Timestamp(cur_date), "value": cur_val, "net_invested": cur_ni})
+    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+
+
+def parse_history_csv(path: Path) -> pd.DataFrame:
+    # Use the python engine so rows with unquoted commas inside value fields
+    # (e.g. numbers formatted as "1,234.56") do not cause C-parser tokeniser errors.
+    # on_bad_lines="warn" drops genuinely corrupt rows with a warning rather than
+    # crashing; in practice the issue is usually a single rogue comma in one cell.
+    df = pd.read_csv(path, engine="python", on_bad_lines="warn")
+    df["date"] = pd.to_datetime(df["date"], format="mixed", dayfirst=True).dt.normalize()
+    df = df.rename(columns={"final_value": "value", "net_investment": "net_invested"})
+    return df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+
+
+# ── 2. Chain-link NAV across a DataFrame ─────────────────────────────────────
+
+def chain_link_nav(df: pd.DataFrame, prev_nav: float, prev_units: float,
+                   prev_ni: float) -> pd.DataFrame:
+    """
+    Add 'nav' and 'units' columns to df using the chain-linking formula.
+    df must have columns: date, value, net_invested  (sorted ascending).
+    prev_* are the values from the last known point before df starts.
+    """
+    df = df.copy()
+    navs, units_list = [], []
+    p_nav, p_units, p_ni = prev_nav, prev_units, prev_ni
+    for _, row in df.iterrows():
+        cf     = row.net_invested - p_ni
+        units  = p_units + cf / p_nav
+        nav    = row.value / units
+        navs.append(nav)
+        units_list.append(units)
+        p_nav, p_units, p_ni = nav, units, row.net_invested
+    df["nav"]   = navs
+    df["units"] = units_list
+    return df
+
+
+def build_full_nav_series(snap_df: pd.DataFrame,
+                          hist_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    1. Prepend a synthetic starting row on STARTING_DATE (2023-01-01):
+       - All net_invested of the first snapshot is treated as deposited on this date.
+       - NAV = 100.0, units = net_invested_first / 100.
+       - Value on starting date = units × 100 = net_invested_first.
+    2. Chain-link from that starting row through all snapshots.
+    3. Bridge into history CSV from the last snapshot.
+    4. Merge, deduplicate, interpolate daily.
+    Returns DataFrame(date, nav, units, value, net_invested) at daily frequency.
+    """
+    first_snap = snap_df.iloc[0]
+
+    # Synthetic starting row: NAV=100, all money treated as invested on 2023-01-01
+    start_units = first_snap.net_invested / STARTING_NAV
+    start_value = first_snap.net_invested   # value = units × NAV = NI at start
+    start_row   = pd.DataFrame([{
+        "date":         STARTING_DATE,
+        "value":        start_value,
+        "net_invested": first_snap.net_invested,
+    }])
+
+    # Prepend start row to snapshots, then chain-link
+    snap_extended = pd.concat([start_row, snap_df], ignore_index=True)
+    snap_linked   = chain_link_nav(snap_extended,
+                                   prev_nav=STARTING_NAV,
+                                   prev_units=start_units,
+                                   prev_ni=first_snap.net_invested)
+    # Fix row 0: no CF on starting date, so nav=100, units=NI/100
+    snap_linked.at[0, "nav"]   = STARTING_NAV
+    snap_linked.at[0, "units"] = start_units
+
+    # Recompute from row 1 onwards with corrected row-0 values
+    prev_nav, prev_units, prev_ni = STARTING_NAV, start_units, first_snap.net_invested
+    for i in range(1, len(snap_linked)):
+        row    = snap_extended.iloc[i]
+        cf     = row.net_invested - prev_ni
+        units  = prev_units + cf / prev_nav
+        nav    = row.value / units
+        snap_linked.at[i, "nav"]   = nav
+        snap_linked.at[i, "units"] = units
+        prev_nav, prev_units, prev_ni = nav, units, row.net_invested
+
+    last = snap_linked.iloc[-1]
+
+    # Step 2: chain-link history CSV from last snapshot
+    hist_linked = chain_link_nav(hist_df,
+                                  prev_nav=last.nav,
+                                  prev_units=last.units,
+                                  prev_ni=last.net_invested)
+
+    # Step 3: merge — history takes precedence
+    combined = pd.concat([
+        snap_linked[["date","nav","units","value","net_invested"]],
+        hist_linked[["date","nav","units","value","net_invested"]],
+    ]).sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+
+    # Step 4: fill daily gaps by linear interpolation
+    daily = pd.DataFrame({"date": pd.date_range(combined.date.min(),
+                                                  combined.date.max(), freq="D")})
+    daily = daily.merge(combined, on="date", how="left")
+    daily[["nav","units","value","net_invested"]] = \
+        daily[["nav","units","value","net_invested"]].interpolate(method="linear")
+
+    return daily.reset_index(drop=True)
+
+
+# ── 3. NAV lookup with interpolation ─────────────────────────────────────────
+
+def get_nav_on(nav_series: pd.DataFrame, target: pd.Timestamp) -> float:
+    exact = nav_series[nav_series.date == target]
+    if not exact.empty:
+        return float(exact.iloc[0].nav)
+    before = nav_series[nav_series.date <= target]
+    after  = nav_series[nav_series.date >= target]
+    if before.empty: return float(nav_series.iloc[0].nav)
+    if after.empty:  return float(nav_series.iloc[-1].nav)
+    d0, n0 = before.iloc[-1].date, float(before.iloc[-1].nav)
+    d1, n1 = after.iloc[0].date,   float(after.iloc[0].nav)
+    span   = max((d1 - d0).days, 1)
+    frac   = (target - d0).days / span
+    return round(n0 + frac * (n1 - n0), 6)
+
+
+# ── 4 & 5. Historical per-account transactions (Approach 3) ──────────────────
+#
+# Uses actual cash flow dates from per-account CSVs.
+# Back-calculates implied account balance at each flow date using the
+# per-account XIRR from the first post-split snapshot.
+#
+# At each cash flow date:
+#   1. FV of all flows to that date at solved rate  = implied balance
+#   2. cash-flow Buy/Sell at NAV  (the external deposit/withdrawal)
+#   3. rebalance pair to hit implied balance with net cash = 0:
+#        Buy  units_new at NAV
+#        Sell units_old at implied_balance / units_old
+#
+# A "seed already done" flag (SEED_DONE_FILE) prevents re-running the
+# expensive historical seed on every daily run. Use --reseed to force it.
+
+SEED_DONE_FILE = HERE / "hm_pp_seed_done.flag"
+
+# Derived automatically from ACCOUNTS — no personal data here
+LEDGER_FILES = {k: v["csv_file"]        for k, v in ACCOUNTS.items()}
+XIRR_COLS    = {k: v["hist_xirr"]       for k, v in ACCOUNTS.items()}
+VAL_COLS     = {k: v["hist_val"]        for k, v in ACCOUNTS.items()}
+
+
+def fv_of_flows(flows_df: pd.DataFrame, target_date: pd.Timestamp, r: float) -> float:
+    """FV at target_date of all flows up to that date, compounded at annual rate r."""
+    past  = flows_df[flows_df["date"] <= target_date]
+    total = 0.0
+    for _, row in past.iterrows():
+        t = (target_date - row["date"]).days / 365.25
+        total += float(row["amount"]) * (1 + r) ** t
+    return total
+
+
+def solve_rate(flows_df: pd.DataFrame, target_date: pd.Timestamp,
+               target_value: float, hint_r: float) -> float:
+    """Find annual rate r such that fv_of_flows(target_date, r) = target_value."""
+    from scipy.optimize import brentq
+    def obj(r):
+        return fv_of_flows(flows_df, target_date, r) - target_value
+    if abs(obj(hint_r)) < 0.10:
+        return hint_r
+    try:
+        return brentq(obj, -0.99, 10.0, xtol=1e-10, maxiter=200)
+    except ValueError:
+        return hint_r
+
+
+def build_historical_transactions(staging_dir: Path, hist_df: pd.DataFrame,
+                                   nav_series: pd.DataFrame) -> list[dict]:
+    """
+    Build per-account transactions for the pre-split period using Approach 3.
+    """
+    # Get first post-split row that has per-account data
+    xirr_present = [c for c in XIRR_COLS.values() if c in hist_df.columns]
+    first_post   = hist_df.dropna(subset=xirr_present, how="all").iloc[0]
+    split_date   = first_post["date"]
+    print(f"  → Historical seed: back-calculating to {split_date.date()}")
+
+    txns      = []
+    end_units = {}   # acc_key -> units held at end of pre-split period
+
+    for acc_key, fname in LEDGER_FILES.items():
+        fpath = staging_dir / fname
+        if not fpath.exists():
+            print(f"  ⚠  {fname} not found — skipping {acc_key}")
+            continue
+
+        acc     = ACCOUNTS[acc_key]
+        sec_acc = acc["securities_account"]
+
+        # Load and aggregate same-day flows
+        df = pd.read_csv(fpath)
+        df["date"] = pd.to_datetime(df["Date"], dayfirst=True).dt.normalize()
+        cash_col   = next(c for c in df.columns if "cash" in c.lower())
+        df["amount"] = pd.to_numeric(
+            df[cash_col].astype(str).str.replace(r"[£,()\s]", "", regex=True),
+            errors="coerce"
+        )
+        flows_all = (df[df["Description"].isin(["Deposit", "Withdraw"])]
+                     .groupby("date")["amount"].sum()
+                     .reset_index()
+                     .sort_values("date"))
+
+        if flows_all.empty:
+            print(f"  ⚠  No flows for {acc_key}")
+            continue
+
+        # Pre-split flows only for solving the rate
+        flows_pre = flows_all[flows_all["date"] < split_date].copy()
+
+        if flows_pre.empty:
+            print(f"  ⚠  No pre-split flows for {acc_key} — skipping historical seed")
+            continue
+
+        # Solve for the rate that reproduces split-date value
+        target_val  = float(first_post[VAL_COLS[acc_key]])
+        stored_xirr = float(first_post[XIRR_COLS[acc_key]]) / 100.0
+        r = solve_rate(flows_pre, split_date, target_val, stored_xirr)
+        simulated   = fv_of_flows(flows_pre, split_date, r)
+        print(f"  → {acc_key}: rate={r*100:.4f}%  "
+              f"simulated=£{simulated:,.2f}  target=£{target_val:,.2f}  "
+              f"error=£{abs(simulated-target_val):,.2f}")
+
+        # Forward-simulate balance at each pre-split flow date
+        prev_units = 0.0
+
+        for _, row in flows_pre.iterrows():
+            d   = row["date"]
+            amt = float(row["amount"])
+            nav = get_nav_on(nav_series, d)
+
+            # Implied balance after this flow
+            bal_after   = fv_of_flows(flows_pre, d, r)
+            units_new   = bal_after / nav
+
+            # 1. Cash-flow transaction at NAV
+            kind = "Buy" if amt > 0 else "Sell"
+            txns.append({
+                "date": d, "type": kind,
+                "value": round(abs(amt), 2),
+                "shares": round(abs(amt) / nav, 6),
+                "quote": round(nav, 6),
+                "securities_account": sec_acc,
+            })
+
+            # 2. Rebalance pair to hit implied balance (net cash = 0)
+            # After the cash flow, units_after_flow = prev_units + amt/nav
+            units_after_flow = prev_units + amt / nav
+            rebal_delta      = units_new - units_after_flow
+
+            if abs(rebal_delta) > 0.0001 and units_after_flow > 0.0001:
+                p_sell = bal_after / units_after_flow
+                txns += [
+                    {"date": d, "type": "Buy",
+                     "value": round(bal_after, 2), "shares": round(units_new, 6),
+                     "quote": round(nav, 6), "securities_account": sec_acc},
+                    {"date": d, "type": "Sell",
+                     "value": round(bal_after, 2), "shares": round(units_after_flow, 6),
+                     "quote": round(p_sell, 6), "securities_account": sec_acc},
+                ]
+
+            prev_units = units_new
+
+        n = len([t for t in txns if t.get("securities_account") == sec_acc])
+        print(f"    {acc_key}: {n} transactions generated  "
+              f"(end units={prev_units:.4f})")
+        end_units[acc_key] = prev_units
+
+    return txns, end_units
+
+
+# ── 6. Daily per-account rebalances (post-split) ─────────────────────────────
+
+def build_rebalance_transactions(hist_df: pd.DataFrame,
+                                  nav_series: pd.DataFrame,
+                                  hist_end_units: dict) -> list[dict]:
+    """
+    Post-split transactions from hm_history.csv.
+
+    hist_end_units: {acc_key: units} — units held at end of pre-split period,
+    passed in from build_historical_transactions so there is no double-counting
+    on SPLIT_DATE.
+
+    For each day:
+      1. If net_invested changed → external flow Buy/Sell at NAV
+      2. Performance rebalance on residual delta_units (net cash = 0):
+           Buy  units_new_perf at NAV
+           Sell units_old      at val_perf / units_old
+         where val_perf = units_new_perf * NAV  (stripping the flow)
+    """
+    txns       = []
+    per_acct   = hist_df[hist_df.date >= SPLIT_DATE].sort_values("date").reset_index(drop=True)
+
+    # Build ni_prev lookup — need net_invested per account per day.
+    # We don't have per-account NI directly; approximate from the ratio of
+    # account value to total portfolio value × total NI.
+    # For flow detection we compare day-to-day deltas; small noise is fine.
+    total_ni_col = "net_invested" if "net_invested" in hist_df.columns else None
+
+    # prev_state: acc_key -> {units, ni_approx}
+    prev_state = {k: {"units": v, "ni_approx": None}
+                  for k, v in hist_end_units.items()}
+
+    for _, row in per_acct.iterrows():
+        nav       = get_nav_on(nav_series, row.date)
+        total_ni  = float(row[total_ni_col]) if total_ni_col else None
+        total_val = sum(
+            float(row[acc["hist_val"]])
+            for acc in ACCOUNTS.values()
+            if acc["hist_val"] in row.index and not pd.isna(row[acc["hist_val"]])
+        )
+
+        for acc_key, acc in ACCOUNTS.items():
+            vcol = acc["hist_val"]
+            if vcol not in row.index or pd.isna(row[vcol]):
+                continue
+            val_today   = float(row[vcol])
+            if val_today <= 0:
+                continue
+            units_today = val_today / nav
+            sec_acc     = acc["securities_account"]
+
+            # Approximate per-account NI as proportional share of total NI
+            if total_ni and total_val and total_val > 0:
+                ni_today = total_ni * (val_today / total_val)
+            else:
+                ni_today = val_today
+
+            if acc_key not in prev_state or prev_state[acc_key]["units"] == 0:
+                # No prior holding — opening buy at NAV
+                prev_state[acc_key] = {"units": units_today, "ni_approx": ni_today}
+                txns.append({"date": row.date, "type": "Buy",
+                             "value": round(val_today, 2),
+                             "shares": round(units_today, 6),
+                             "quote": round(nav, 6),
+                             "securities_account": sec_acc})
+                continue
+
+            prev       = prev_state[acc_key]
+            units_old  = prev["units"]
+            ni_old     = prev["ni_approx"] if prev["ni_approx"] is not None else ni_today
+
+            delta_ni    = ni_today - ni_old
+            delta_units = units_today - units_old
+
+            # 1. External cash flow at NAV
+            if abs(delta_ni) > 1.0:
+                ext_units = delta_ni / nav
+                kind = "Buy" if delta_ni > 0 else "Sell"
+                txns.append({"date": row.date, "type": kind,
+                             "value": round(abs(delta_ni), 2),
+                             "shares": round(abs(ext_units), 6),
+                             "quote": round(nav, 6),
+                             "securities_account": sec_acc})
+                units_after_flow = units_old + ext_units
+            else:
+                ext_units        = 0.0
+                units_after_flow = units_old
+
+            # 2. Performance rebalance (net cash = 0)
+            rebal_delta = units_today - units_after_flow
+            if abs(rebal_delta) > 0.0001 and units_after_flow > 0.0001:
+                val_perf = units_today * nav   # performance-only value
+                p_sell   = val_perf / units_after_flow
+                txns += [
+                    {"date": row.date, "type": "Buy",
+                     "value": round(val_perf, 2), "shares": round(units_today, 6),
+                     "quote": round(nav, 6), "securities_account": sec_acc},
+                    {"date": row.date, "type": "Sell",
+                     "value": round(val_perf, 2), "shares": round(units_after_flow, 6),
+                     "quote": round(p_sell, 6), "securities_account": sec_acc},
+                ]
+
+            prev_state[acc_key] = {"units": units_today, "ni_approx": ni_today}
+
+    return txns
+
+
+# ── 7. Google Sheets helpers ──────────────────────────────────────────────────
+
+def ensure_sheet_tab(svc, title: str):
+    meta     = svc.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+    existing = [s["properties"]["title"] for s in meta["sheets"]]
+    if title not in existing:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": title}}}]}
+        ).execute()
+        print(f"  → Created tab '{title}'")
+
+
+def write_sheet(svc, tab: str, df: pd.DataFrame):
+    ensure_sheet_tab(svc, tab)
+    values = [list(df.columns)] + df.astype(str).values.tolist()
+    svc.spreadsheets().values().clear(spreadsheetId=SHEET_ID, range=f"{tab}!A:Z").execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=SHEET_ID, range=f"{tab}!A1",
+        valueInputOption="USER_ENTERED", body={"values": values}
+    ).execute()
+    print(f"  → {len(df)} rows → '{tab}'")
+
+
+# ── 8. Main seed ──────────────────────────────────────────────────────────────
+
+def build_and_push(work_dir: Path = None):
+    work_dir    = work_dir or HERE
+    staging_dir = work_dir / "hm_staging"
+    snap_path   = work_dir / "snapshots5.txt"
+    hist_path   = work_dir / "snapshots" / "hm_history.csv"
+
+    for p, label in [(snap_path,"snapshots5.txt"), (hist_path,"hm_history.csv")]:
+        if not p.exists():
+            print(f"  ⚠  {label} not found at {p} — skipping PP build")
+            return
+
+    print("  Parsing sources...")
+    snap_df = parse_snapshots_txt(snap_path)
+    hist_df = parse_history_csv(hist_path)
+    print(f"  → {len(snap_df)} snapshot rows, {len(hist_df)} history rows")
+
+    nav_series = build_full_nav_series(snap_df, hist_df)
+    last = nav_series.iloc[-1]
+    print(f"  → NAV series: {nav_series.date.min().date()} → {nav_series.date.max().date()}")
+    print(f"  → Latest: NAV={last.nav:.6f}  units={last.units:.4f}")
+    # Show a few key NAV values for verification
+    for chk_date in [STARTING_DATE, pd.Timestamp("2023-08-30"), pd.Timestamp("2023-10-09")]:
+        row = nav_series[nav_series.date == chk_date]
+        if not row.empty:
+            r = row.iloc[0]
+            print(f"  → {chk_date.date()}: NAV={r.nav:.6f}  units={r.units:.4f}")
+
+    # Quotes
+    quotes_df = nav_series[["date","nav"]].copy()
+    quotes_df["date"] = quotes_df["date"].dt.strftime("%Y-%m-%d")
+    quotes_df.columns = ["Date","Close"]
+    quotes_df["Close"] = quotes_df["Close"].round(4)
+    quotes_df.to_csv(QUOTES_FILE, sep=";", index=False)
+    print(f"  → Quotes: {QUOTES_FILE} ({len(quotes_df)} rows)")
+
+    # Transactions — historical seed (approach 3) + post-split rebalances
+    hist_txns, end_units = build_historical_transactions(staging_dir, hist_df, nav_series)
+    rebal_txns           = build_rebalance_transactions(hist_df, nav_series, end_units)
+
+    print(f"  → Historical: {len(hist_txns)}  Rebalance: {len(rebal_txns)}")
+
+    all_txns = hist_txns + rebal_txns
+    txn_df = pd.DataFrame(all_txns).sort_values(["date","securities_account","type"])
+    txn_df["date"]   = txn_df["date"].dt.strftime("%Y-%m-%d")
+    txn_df["isin"]   = HMFUND_ISIN
+    txn_df["ticker"] = HMFUND_TICKER
+    # Reorder columns to PP import format
+    txn_df = txn_df[["date","type","value","shares","quote","isin","ticker","securities_account"]]
+    txn_df.columns   = ["Date","Type","Value","Shares","Quote","ISIN","Ticker","Securities Account"]
+    txn_df.to_csv(TXN_FILE, sep=";", index=False)
+    print(f"  → Transactions: {TXN_FILE} ({len(txn_df)} rows)")
+
+    # State file
+    state = {
+        "last_date":    str(last.date.date()),
+        "nav":          round(float(last.nav),    6),
+        "total_units":  round(float(last.units),  6),
+        "net_invested": round(float(last.net_invested), 2),
+        "units":        {},
+        "acct_ni":      {},
+    }
+    last_hist = hist_df.iloc[-1]
+    nav_last  = float(last.nav)
+    for acc_key, acc in ACCOUNTS.items():
+        vcol = acc["hist_val"]
+        if vcol in last_hist.index and not pd.isna(last_hist[vcol]):
+            v = float(last_hist[vcol])
+            state["units"][acc_key]  = round(v / nav_last, 6)
+            state["acct_ni"][acc_key] = round(v, 2)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+    print(f"  → State: {STATE_FILE}")
+
+    # Push to Sheets
+    if SHEET_ID:
+        try:
+            svc = _get_service()
+            write_sheet(svc, "HM_pp_quotes",        quotes_df)
+            write_sheet(svc, "HM_pp_transactions",   txn_df)
+            print("  ✓ Pushed to Google Sheets")
+        except Exception as e:
+            print(f"  ⚠  Sheets push failed (non-fatal): {e}")
+
+
+# ── 9. Daily incremental update (called from run.py) ─────────────────────────
+
+def daily_update(work_dir: Path = None, *, nav: float, date_str: str,
+                  account_values: dict, account_net_invested: dict):
+    """
+    nav                  — today's chain-linked NAV (computed by run.py)
+    date_str             — 'YYYY-MM-DD'
+    account_values       — {acc_key: current_value}
+    account_net_invested — {acc_key: net_invested}
+    """
+    work_dir = work_dir or HERE
+    if not STATE_FILE.exists():
+        print("  ⚠  hm_pp_state.json not found — run 'python pp_index.py' first")
+        return
+
+    prev  = json.load(open(STATE_FILE))
+    txns  = []
+
+    for acc_key, acc in ACCOUNTS.items():
+        val  = account_values.get(acc_key, 0.0)
+        ni   = account_net_invested.get(acc_key, 0.0)
+        if not val:
+            continue
+
+        units_today = val / nav
+        units_prev  = prev.get("units", {}).get(acc_key, 0.0)
+        ni_prev     = prev.get("acct_ni", {}).get(acc_key, 0.0)
+        delta_ni    = ni - ni_prev
+        delta_units = units_today - units_prev
+        pp_acc      = acc["pp_account"]
+        cash        = acc["pp_cash"]
+
+        # External flow — Buy/Sell at NAV only (no Deposit/Removal)
+        sec_acc = acc["securities_account"]
+        if abs(delta_ni) > 1.0:
+            ext_units   = delta_ni / nav
+            rebal_units = delta_units - ext_units
+            kind = "Buy" if delta_ni > 0 else "Sell"
+            txns.append({"date": date_str, "type": kind,
+                         "value": round(abs(delta_ni), 2),
+                         "shares": round(abs(ext_units), 6),
+                         "quote": round(nav, 6),
+                         "securities_account": sec_acc})
+        else:
+            rebal_units = delta_units
+
+        # ── Two-leg performance rebalance, net cash = 0 ─────────────────
+        # Use performance-only value (strip the flow) so P&L is not distorted
+        sec_acc         = acc["securities_account"]
+        units_new_final = units_prev + rebal_units  # after stripping ext flow
+        if abs(rebal_units) > 0.0001 and units_prev > 0.0001:
+            units_after_flow = units_prev + (ext_units if abs(delta_ni) > 1.0 else 0.0)
+            val_perf = units_new_final * nav
+            p_sell   = val_perf / units_after_flow if units_after_flow > 0 else nav
+            txns += [
+                {"date": date_str, "type": "Buy",
+                 "value": round(val_perf, 2), "shares": round(units_new_final, 6),
+                 "quote": round(nav, 6), "securities_account": sec_acc},
+                {"date": date_str, "type": "Sell",
+                 "value": round(val_perf, 2), "shares": round(units_after_flow, 6),
+                 "quote": round(p_sell, 6), "securities_account": sec_acc},
+            ]
+
+        prev.setdefault("units",{})[acc_key]   = round(units_today, 6)
+        prev.setdefault("acct_ni",{})[acc_key] = round(ni, 2)
+
+    # Unit balance check
+    total_units = sum(prev["units"].values())
+    total_val   = sum(account_values.values())
+    implied     = total_val / nav if nav else 0
+    diff        = abs(total_units - implied)
+    if diff > 0.1:
+        print(f"  ⚠  Unit imbalance: Σ={total_units:.3f}  value/NAV={implied:.3f}  diff={diff:.3f}")
+    else:
+        print(f"  ✓ Unit check OK: Σunits={total_units:.3f} ≈ value/NAV={implied:.3f}")
+
+    # Update state
+    prev["nav"]          = round(nav, 6)
+    prev["last_date"]    = date_str
+    prev["net_invested"] = round(sum(account_net_invested.values()), 2)
+    with open(STATE_FILE, "w") as f:
+        json.dump(prev, f, indent=2)
+
+    # Append to local files
+    with open(QUOTES_FILE, "a") as f:
+        f.write(f"{date_str};{round(nav,4)}\n")
+    if txns:
+        with open(TXN_FILE, "a") as f:
+            for t in txns:
+                f.write(f"{t['date']};{t['type']};{t['value']};{t['shares']};"
+                        f"{t['quote']};{HMFUND_ISIN};{HMFUND_TICKER};"
+                        f"{t['securities_account']}\n")
+        print(f"  → {len(txns)} PP transactions for {date_str}")
+    else:
+        print(f"  → No PP transactions for {date_str} (NAV-only day)")
+
+    # Push to Sheets
+    if SHEET_ID:
+        try:
+            svc       = _get_service()
+            quotes_df = pd.read_csv(QUOTES_FILE, sep=";")
+            txn_df    = pd.read_csv(TXN_FILE,    sep=";")
+            write_sheet(svc, "HM_pp_quotes",       quotes_df)
+            write_sheet(svc, "HM_pp_transactions",  txn_df)
+        except Exception as e:
+            print(f"  ⚠  PP Sheets push failed (non-fatal): {e}")
+
+
+# ── 10. NAV calculator for run.py ─────────────────────────────────────────────
+
+def compute_daily_nav(current_value: float, current_ni: float) -> float:
+    """
+    Called from run.py to get today's chain-linked NAV.
+    Reads previous state from hm_pp_state.json.
+    """
+    if not STATE_FILE.exists():
+        return None
+    prev       = json.load(open(STATE_FILE))
+    prev_nav   = prev["nav"]
+    prev_units = prev["total_units"]
+    prev_ni    = prev["net_invested"]
+    cf         = current_ni - prev_ni
+    units      = prev_units + cf / prev_nav
+    return round(current_value / units, 6)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Build/update HMFUND PP data")
+    parser.add_argument("--reseed", action="store_true",
+                        help="Force re-run of historical seed even if already done")
+    parser.add_argument("work_dir", nargs="?", default=".",
+                        help="Working directory (default: current)")
+    args = parser.parse_args()
+
+    work = Path(args.work_dir).resolve()
+    seed_flag = work / "hm_pp_seed_done.flag"
+
+    if args.reseed and seed_flag.exists():
+        seed_flag.unlink()
+        print("  → Seed flag cleared — will re-run full historical seed")
+
+    build_and_push(work)

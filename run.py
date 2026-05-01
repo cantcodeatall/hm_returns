@@ -28,6 +28,8 @@ from housemartin_scraper import run_scraper, STAGING_DIR
 from merge_csv import merge_csv_files
 from irr5 import calculate_irr, calculate_etf_irr, create_additional_dataframe
 from report_generator import generate_report
+from gsheets import push_results
+from pp_index import build_and_push as pp_build_and_push
 import numpy as np
 
 
@@ -71,8 +73,7 @@ def main():
 
     if skip_scrape:
         print("  ⚡ --skip-scrape: reusing existing files in hm_staging/")
-        # Re-derive balances from env (or prompt user)
-        account_results = _load_staging_results()
+        account_results = _load_staging_results(from_sheets=False)
     else:
         account_results = run_scraper(headless=headless)
 
@@ -84,15 +85,26 @@ def main():
     print(f"\n  Total consolidated balance: £{total_balance:,.2f}")
     for r in account_results:
         print(f"    {r['name']}: £{r['balance']:,.2f}")
+        for sa in r.get("sub_accounts", []):
+            print(f"      └ {sa['label']}")
 
     # ── Step 2: Merge CSVs ────────────────────────────────────────────────────
     step(2, "Merging transaction CSVs")
 
+    # Use the "all accounts" CSV per person for the consolidated XIRR merge
     csv_paths = [r["csv_path"] for r in account_results]
-    # Copy all CSVs into a temp merge folder
     merge_input_dir = HERE / "hm_merge_input"
     if merge_input_dir.exists():
-        shutil.rmtree(merge_input_dir)
+        # On Windows the folder may be briefly locked by Dropbox/antivirus — retry
+        import time
+        for attempt in range(5):
+            try:
+                shutil.rmtree(merge_input_dir)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(1)
     merge_input_dir.mkdir()
 
     for p in csv_paths:
@@ -152,6 +164,68 @@ def main():
     print(f"  Total Return   : {total_return * 100:.2f}%")
     print(f"  XIRR           : {irr_result * 100:.2f}%" if irr_result else "  XIRR: N/A")
 
+    # ── Step 3b: Calculate per-sub-account XIRR ─────────────────────────────
+    step(3, "Calculating per sub-account XIRR")
+
+    sub_account_results = []  # [{holder, label, irr, net_investment, current_value, pnl, total_return}]
+    for r in account_results:
+        tab_balances = r.get("tab_balances", {})
+        tab_details  = r.get("tab_details", {})
+        for sa in r.get("sub_accounts", []):
+            sa_csv      = sa["csv_path"]
+            sa_label    = sa["label"]
+            sa_balance  = tab_balances.get(sa_label)
+            sa_detail   = tab_details.get(sa_label, {})
+            try:
+                if sa_balance is None:
+                    raise ValueError(f"No dashboard balance found for tab '{sa_label}'")
+
+                # Re-merge this sub-account CSV with its own current value injected
+                sa_merged = HERE / "hm_merge_input" / f"_sa_{r['name']}_{sa_label}.csv".replace(" ", "_")
+                merge_csv_files(
+                    input_path=str(sa_csv.parent),
+                    output_file=str(sa_merged),
+                    current_value=sa_balance,
+                    single_file=str(sa_csv),
+                )
+                sa_irr, sa_ni, _, sa_df, _ = calculate_irr(str(sa_merged), ETF_TICKERS[0])
+                sa_desc    = "Description" if "Description" in sa_df.columns else sa_df.columns[2]
+                sa_cv_rows = sa_df.loc[sa_df[sa_desc] == "Current Value", "Cash Flow"]
+                if sa_cv_rows.empty:
+                    raise ValueError("No Current Value row after merge")
+                sa_cv  = sa_cv_rows.values[0]
+                sa_pnl = sa_cv - sa_ni
+                sa_ret = sa_pnl / sa_ni if sa_ni != 0 else 0
+                sub_account_results.append({
+                    "holder":           r["name"],
+                    "label":            sa_label,
+                    "irr":              sa_irr,
+                    "net_investment":   sa_ni,
+                    "current_value":    sa_cv,
+                    "pnl":              sa_pnl,
+                    "total_return":     sa_ret,
+                    "gross_investment": sa_detail.get("gross_investment", 0.0),
+                    "cash":             sa_detail.get("cash", 0.0),
+                })
+                irr_str = f"{sa_irr*100:.2f}%" if sa_irr else "N/A"
+                print(f"  → {r['name']} / {sa_label}: XIRR={irr_str}  £{sa_cv:,.2f}")
+            except Exception as e:
+                print(f"  ⚠  Sub-account XIRR failed for {r['name']}/{sa_label}: {e}")
+                sub_account_results.append({
+                    "holder": r["name"], "label": sa_label,
+                    "irr": None, "net_investment": None,
+                    "current_value": None, "pnl": None, "total_return": None,
+                    "gross_investment": sa_detail.get("gross_investment", 0.0),
+                    "cash":             sa_detail.get("cash", 0.0),
+                })
+
+    # Compute today's chain-linked NAV for HMFUND (needed by report + history CSV)
+    try:
+        from pp_index import compute_daily_nav, STATE_FILE as PP_STATE_FILE
+        pp_nav_today = compute_daily_nav(current_value, net_investment) if PP_STATE_FILE.exists() else None
+    except Exception:
+        pp_nav_today = None
+
     # ── Step 4: Generate HTML report ──────────────────────────────────────────
     step(4, "Generating HTML report")
 
@@ -167,17 +241,34 @@ def main():
         total_return     = total_return,
         benchmarks       = benchmarks,
         account_balances = account_results,
+        sub_accounts     = sub_account_results,
+        hmfund_nav       = pp_nav_today,
         output_path      = str(report_filename),
     )
 
     # Keep a "latest" copy for easy access
+    # Ensure file is fully flushed to disk before Cloud Sync can see it
+    import time
+    try:
+        with open(report_filename, "rb") as f:
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    time.sleep(1)   # brief pause so the OS releases any write buffers
     shutil.copy(report_filename, latest_report)
+    # fsync the latest copy too
+    try:
+        with open(latest_report, "rb") as f:
+            os.fsync(f.fileno())
+    except OSError:
+        pass
 
     # ── Step 5: Write snapshot txt + append to CSV history ───────────────────
     step(5, "Writing snapshot & history")
 
     now_dt   = datetime.now()
-    date_str = now_dt.strftime("%Y/%m/%d %H:%M")
+    date_str     = now_dt.strftime("%Y/%m/%d %H:%M")   # snapshot txt format
+    date_str_gs  = now_dt.strftime("%Y-%m-%d %H:%M")    # Google Sheets format
     ts_str   = now_dt.strftime("%Y%m%d_%H%M%S")
 
     def fmt_pct(v):
@@ -208,6 +299,11 @@ def main():
     lines.append(f"Total return: {fmt_pct(total_return)}")
     lines.append(f"Internal rate of return (IRR): {fmt_pct(irr_result)}")
     lines.append("===========")
+    lines.append("Sub-account breakdown:")
+    for sa in sub_account_results:
+        lines.append(f"  {sa['holder']} / {sa['label']}:")
+        lines.append(f"    IRR: {fmt_pct(sa['irr'])}  |  Value: {fmt_gbp(sa['current_value'])}  |  P&L: {fmt_gbp(sa['pnl'])}")
+    lines.append("===========")
     td = time_difference
     if td:
         y = td.days // 365
@@ -237,6 +333,11 @@ def main():
     # Save timestamped txt snapshot
     txt_path = SNAPSHOTS_DIR / f"hm_snapshot_{ts_str}.txt"
     txt_path.write_text(txt_content, encoding="utf-8")
+    try:
+        with open(txt_path, "rb") as f:
+            os.fsync(f.fileno())
+    except OSError:
+        pass
     print(f"  → Snapshot txt : {txt_path}")
 
     # ── Append to CSV history ─────────────────────────────────────────────────
@@ -246,15 +347,22 @@ def main():
     # Build header + row
     base_fields = ["date", "net_investment", "pnl", "final_value",
                    "total_return_pct", "irr_pct",
-                   "avg_time_held_days", "net_time_weighted_investment"]
+                   "avg_time_held_days", "net_time_weighted_investment",
+                   "hmfund_nav"]
     bench_fields = []
     for b in benchmarks:
         t = b["ticker"].replace(".", "_")
         bench_fields += [f"{t}_pnl", f"{t}_final_value",
                          f"{t}_total_return_pct", f"{t}_irr_pct"]
-    acct_fields  = [a["name"].replace(" ", "_") for a in account_results]
+    acct_fields = [a["name"].replace(" ", "_") for a in account_results]
     acct_fields += ["total_balance"]
-    all_fields   = base_fields + bench_fields + acct_fields
+    # Sub-account fields: one set of irr/value/pnl/return per holder+label
+    sa_fields = []
+    for sa in sub_account_results:
+        key = f"{sa['holder']}_{sa['label']}".replace(" ", "_")
+        sa_fields += [f"{key}_value", f"{key}_pnl",
+                      f"{key}_total_return_pct", f"{key}_irr_pct"]
+    all_fields = base_fields + bench_fields + acct_fields + sa_fields
 
     row = {
         "date":                        date_str,
@@ -265,6 +373,7 @@ def main():
         "irr_pct":                     round(irr_result * 100, 4)   if irr_result   else None,
         "avg_time_held_days":          td.days if td else None,
         "net_time_weighted_investment": round(net_twi, 2),
+        "hmfund_nav":                  round(pp_nav_today, 6) if pp_nav_today else None,
     }
     for b in benchmarks:
         t = b["ticker"].replace(".", "_")
@@ -275,6 +384,12 @@ def main():
     for a in account_results:
         row[a["name"].replace(" ", "_")] = round(a["balance"], 2)
     row["total_balance"] = round(sum(a["balance"] for a in account_results), 2)
+    for sa in sub_account_results:
+        key = f"{sa['holder']}_{sa['label']}".replace(" ", "_")
+        row[f"{key}_value"]            = round(sa["current_value"], 2) if sa["current_value"] is not None else None
+        row[f"{key}_pnl"]              = round(sa["pnl"], 2)           if sa["pnl"]           is not None else None
+        row[f"{key}_total_return_pct"] = round(sa["total_return"] * 100, 4) if sa["total_return"] is not None else None
+        row[f"{key}_irr_pct"]          = round(sa["irr"] * 100, 4)    if sa["irr"]           is not None else None
 
     write_header = not csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
@@ -282,7 +397,77 @@ def main():
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
     print(f"  → History CSV  : {csv_path}")
+
+    # ── Step 6: Push to Google Sheets ───────────────────────────────────────
+    step(6, "Pushing results to Google Sheet")
+    try:
+        push_results(
+            snapshot_date       = date_str_gs,
+            net_investment      = net_investment,
+            current_value       = current_value,
+            pnl                 = pnl,
+            total_return        = total_return,
+            irr                 = irr_result,
+            account_results     = account_results,
+            sub_account_results = sub_account_results,
+            benchmarks          = benchmarks,
+            ticker_names        = TICKER_NAMES,
+        )
+    except Exception as e:
+        print(f"  ⚠  Google Sheets push failed (non-fatal): {e}")
+
+    # ── Step 7: Update PP index (daily incremental) ──────────────────────────
+    step(7, "Updating Portfolio Performance index")
+    try:
+        from pp_index import daily_update, compute_daily_nav, STATE_FILE
+
+        if not STATE_FILE.exists():
+            print("  → PP state not initialised — run 'python pp_index.py' once first")
+        else:
+            # Map sub_account_results to pp_index acc_keys
+            # acc_key format: {HOLDER_INITIAL}_{reg|isa}
+            # e.g. holder="MP", label="Regular account" → "MP_reg"
+            acct_vals = {}
+            acct_ni   = {}
+            for sa in sub_account_results:
+                holder = sa["holder"].upper()
+                label  = sa["label"].lower()
+                if "regular" in label:
+                    acc_key = f"{holder}_reg"
+                elif "isa" in label:
+                    acc_key = f"{holder}_isa"
+                else:
+                    continue
+                if sa.get("current_value"):
+                    acct_vals[acc_key] = sa["current_value"]
+                    acct_ni[acc_key]   = sa.get("net_investment") or 0.0
+
+            # Compute today's chain-linked NAV from portfolio-level figures
+            pp_nav = compute_daily_nav(
+                current_value = current_value,
+                current_ni    = net_investment,
+            )
+            if pp_nav is None:
+                print("  ⚠  Could not compute PP NAV — skipping")
+            else:
+                print(f"  → PP NAV today: {pp_nav:.6f}")
+                daily_update(
+                    work_dir             = HERE,
+                    nav                  = pp_nav,
+                    date_str             = now_dt.strftime("%Y-%m-%d"),
+                    account_values       = acct_vals,
+                    account_net_invested = acct_ni,
+                )
+    except Exception as e:
+        import traceback
+        print(f"  ⚠  PP index update failed (non-fatal): {e}")
+        print(traceback.format_exc())
 
     # ── Done ──────────────────────────────────────────────────────────────────
     print(f"\n{'=' * 55}")
@@ -290,36 +475,119 @@ def main():
     print(f"  Report   : {report_filename}")
     print(f"  Snapshot : {txt_path}")
     print(f"  History  : {csv_path}")
+    print(f"  Sheet    : {os.getenv('GSHEET_ID', '(GSHEET_ID not set)')} → {os.getenv('GSHEET_SHEET_NAME', 'HM')}")
+    print(f"  PP index : HM_prices_portfolio + per-account + HM_transactions")
     print(f"{'=' * 55}\n")
+
+    # Touch all output files at the very end to update mtime — this ensures
+    # Cloud Sync (which watches mtime) picks them up after the run completes.
+    import time
+    time.sleep(2)   # let any pending I/O settle first
+    for f in [report_filename, latest_report, txt_path, csv_path]:
+        try:
+            p = Path(f)
+            if p.exists():
+                p.touch()
+        except Exception:
+            pass
 
     # Open report in default browser on Windows
     if sys.platform == "win32":
         os.startfile(str(latest_report))
 
 
-def _load_staging_results():
+def _load_staging_results(from_sheets: bool = False):
     """
-    When --skip-scrape is used: find CSVs already in hm_staging/ and ask
-    the user to enter balances manually (or read from a sidecar .txt).
+    When --skip-scrape or --from-sheets is used: find CSVs already in hm_staging/
+    and pair them with balances — either from Google Sheets or entered manually.
+
+    Sheet matching: the sheet's Account column must contain the account name
+    (e.g. "MP", "EH", "TC") — case-insensitive partial match is fine.
     """
     staging = STAGING_DIR
-    csvs    = list(staging.glob("*.csv"))
+    # Only pick up the "all accounts" CSVs (not sub-account files)
+    csvs = sorted(
+        f for f in staging.glob("*.csv")
+        if not f.stem.startswith("_sa_")
+        and ("_all" in f.stem or "_transactions" in f.stem)
+    )
+    if not csvs:
+        # Fall back to any CSV
+        csvs = sorted(staging.glob("*.csv"))
     if not csvs:
         print(f"  ✗  No CSVs found in {staging}. Run without --skip-scrape first.")
         sys.exit(1)
 
-    results = []
-    print(f"  Found {len(csvs)} CSV(s) in staging. Enter balances manually:")
-    for csv in sorted(csvs):
-        name = csv.stem.replace("_transactions", "").replace("_", " ")
-        while True:
-            try:
-                val = float(input(f"    Balance for {name} (£): ").replace(",", "").replace("£", ""))
-                results.append({"name": name, "balance": val, "csv_path": csv})
-                break
-            except ValueError:
-                print("    Invalid amount, try again.")
-    return results
+    # Build name -> csv_path map
+    name_to_csv = {}
+    for csv_path in csvs:
+        stem = csv_path.stem
+        name = (stem.replace("_all", "")
+                    .replace("_transactions", "")
+                    .replace("_", " ")
+                    .strip())
+        name_to_csv[name] = csv_path
+
+    print(f"  Found {len(name_to_csv)} account CSV(s) in staging: {list(name_to_csv.keys())}")
+
+    if from_sheets:
+        try:
+            sheet_rows = fetch_balances()
+            print(f"  → Fetched {len(sheet_rows)} rows from Google Sheet")
+        except Exception as e:
+            print(f"  ✗  Google Sheet fetch failed: {e}")
+            sys.exit(1)
+
+        results = []
+        for name, csv_path in name_to_csv.items():
+            # Match sheet row by account name (case-insensitive partial)
+            match = next(
+                (r for r in sheet_rows
+                 if name.lower() in r["account"].lower()
+                 or r["account"].lower() in name.lower()),
+                None
+            )
+            if match is None:
+                print(f"  ⚠  No sheet row matched for '{name}' — skipping")
+                continue
+            balance = match["balance"]
+            if balance is None:
+                print(f"  ⚠  Sheet row for '{name}' has no balance — skipping")
+                continue
+            print(f"  → {name}: £{balance:,.2f}  (from sheet: {match['account']})")
+            results.append({
+                "name":        name,
+                "balance":     balance,
+                "csv_path":    csv_path,
+                "sub_accounts": [],
+                "tab_balances": {},
+                "tab_details":  {},
+            })
+        return results
+
+    else:
+        # Manual entry fallback
+        results = []
+        print("  Enter balances manually:")
+        for name, csv_path in name_to_csv.items():
+            while True:
+                try:
+                    val = float(
+                        input(f"    Balance for {name} (£): ")
+                        .replace(",", "").replace("£", "")
+                    )
+                    results.append({
+                        "name":        name,
+                        "balance":     val,
+                        "csv_path":    csv_path,
+                        "sub_accounts": [],
+                        "tab_balances": {},
+                        "tab_details":  {},
+                    })
+                    break
+                except ValueError:
+                    print("    Invalid amount, try again.")
+        return results
 
 
 if __name__ == "__main__":
