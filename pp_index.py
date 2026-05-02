@@ -30,9 +30,9 @@ HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
 from gsheets import _get_service, SHEET_ID
 
-STARTING_NAV   = 100.0
-STARTING_DATE  = pd.Timestamp("2023-01-01")
-SPLIT_DATE     = pd.Timestamp("2026-03-14")  # first date with per-account data in hm_history.csv
+STARTING_NAV  = 100.0
+STARTING_DATE = pd.Timestamp(os.getenv("PP_STARTING_DATE", "2023-01-01"))
+SPLIT_DATE    = pd.Timestamp(os.getenv("PP_SPLIT_DATE",    "2026-03-14"))
 STATE_FILE   = HERE / "hm_pp_state.json"
 QUOTES_FILE  = HERE / "hmfund_quotes.csv"
 TXN_FILE     = HERE / "hmfund_transactions_seed.csv"
@@ -46,23 +46,65 @@ TXN_FILE     = HERE / "hmfund_transactions_seed.csv"
 #   csv_file           — filename of the per-account CSV in hm_staging/
 #   pp_account         — same as securities_account (kept for legacy compatibility)
 #   pp_cash            — deposit account name in PP (can match securities_account)
-ACCOUNTS = {
-    "acc1_reg": {"securities_account": "Acc1 HM Reg", "hist_val": "acc1_reg_final_value",
-                 "hist_xirr": "acc1_reg_XIRR", "csv_file": "acc1_regular_acc.csv",
-                 "pp_account": "Acc1 HM Reg", "pp_cash": "Acc1 HM Reg (GBP)"},
-    "acc1_isa": {"securities_account": "Acc1 HM ISA", "hist_val": "acc1_ISA_final_value",
-                 "hist_xirr": "acc1_ISA_XIRR", "csv_file": "acc1_isa_acc.csv",
-                 "pp_account": "Acc1 HM ISA", "pp_cash": "Acc1 HM ISA (GBP)"},
-    "acc2_reg": {"securities_account": "Acc2 HM Reg", "hist_val": "acc2_reg_final_value",
-                 "hist_xirr": "acc2_reg_XIRR", "csv_file": "acc2_regular_acc.csv",
-                 "pp_account": "Acc2 HM Reg", "pp_cash": "Acc2 HM Reg (GBP)"},
-    "acc2_isa": {"securities_account": "Acc2 HM ISA", "hist_val": "acc2_ISA_final_value",
-                 "hist_xirr": "acc2_ISA_XIRR", "csv_file": "acc2_isa_acc.csv",
-                 "pp_account": "Acc2 HM ISA", "pp_cash": "Acc2 HM ISA (GBP)"},
-    "acc3_reg": {"securities_account": "Acc3 HM Reg", "hist_val": "acc3_reg_final_value",
-                 "hist_xirr": "acc3_reg_XIRR", "csv_file": "acc3_regular_acc.csv",
-                 "pp_account": "Acc3 HM Reg", "pp_cash": "Acc3 HM Reg (GBP)"},
-}
+def _build_accounts() -> dict:
+    """
+    Build the ACCOUNTS dict from .env variables.
+
+    For each account defined in .env (HM_ACCOUNT1_NAME etc.) and each
+    sub-account type in PP_ACCOUNT_TYPES, constructs the full account config.
+
+    .env variables used:
+        HM_ACCOUNT1_NAME=Name1     ← short identifier used in filenames/columns
+        HM_ACCOUNT2_NAME=Name2
+        HM_ACCOUNT3_NAME=Name3
+        PP_ACCOUNT_TYPES=reg,isa   ← sub-account types (default: reg,isa)
+
+        # Optional: override the PP securities account display name prefix
+        # If not set, defaults to "{HM_ACCOUNTn_NAME} HM"
+        PP_ACCOUNT1_PP_NAME=Name1 HM
+        PP_ACCOUNT2_PP_NAME=Name2 HM
+        PP_ACCOUNT3_PP_NAME=Name3 HM
+    """
+    accounts = {}
+    types_str = os.getenv("PP_ACCOUNT_TYPES", "reg,isa")
+    sub_types = [t.strip().lower() for t in types_str.split(",") if t.strip()]
+
+    for i in range(1, 4):
+        name = os.getenv(f"HM_ACCOUNT{i}_NAME", "").strip()
+        if not name:
+            continue
+        pp_prefix = os.getenv(f"PP_ACCOUNT{i}_PP_NAME", f"{name} HM").strip()
+
+        for sub in sub_types:
+            acc_key = f"{name}_{sub}"
+            # Column names in hm_history.csv follow the pattern set by run.py:
+            #   {NAME}_reg_final_value  or  {NAME}_ISA_final_value
+            sub_col = "ISA" if sub == "isa" else sub
+            hist_val  = f"{name}_{sub_col}_final_value"
+            hist_xirr = f"{name}_{sub_col}_XIRR"
+            # Staging CSV filename
+            sub_file = "isa" if sub == "isa" else "regular"
+            csv_file  = f"{name}_{sub_file}_acc.csv"
+            # PP display name
+            sec_acc   = f"{pp_prefix} {sub.upper()}"
+
+            accounts[acc_key] = {
+                "securities_account": sec_acc,
+                "hist_val":           hist_val,
+                "hist_xirr":          hist_xirr,
+                "csv_file":           csv_file,
+                "pp_account":         sec_acc,
+                "pp_cash":            f"{sec_acc} (GBP)",
+            }
+
+    if not accounts:
+        raise ValueError(
+            "No accounts found — set HM_ACCOUNT1_NAME etc. in your .env file"
+        )
+    return accounts
+
+
+ACCOUNTS = _build_accounts()
 
 HMFUND_ISIN   = "XX000HM00001"
 HMFUND_TICKER = "HM"
@@ -656,10 +698,11 @@ def daily_update(work_dir: Path = None, *, nav: float, date_str: str,
     else:
         print(f"  ✓ Unit check OK: Σunits={total_units:.3f} ≈ value/NAV={implied:.3f}")
 
-    # Update state
+    # Update state — recalculate total_units from per-account units
     prev["nav"]          = round(nav, 6)
     prev["last_date"]    = date_str
     prev["net_invested"] = round(sum(account_net_invested.values()), 2)
+    prev["total_units"]  = round(sum(prev["units"].values()), 6)
     with open(STATE_FILE, "w") as f:
         json.dump(prev, f, indent=2)
 
@@ -694,15 +737,19 @@ def compute_daily_nav(current_value: float, current_ni: float) -> float:
     """
     Called from run.py to get today's chain-linked NAV.
     Reads previous state from hm_pp_state.json.
+    Uses sum of per-account units as the authoritative unit count
+    (total_units may be stale if daily_update ran on an older version).
     """
     if not STATE_FILE.exists():
         return None
-    prev       = json.load(open(STATE_FILE))
-    prev_nav   = prev["nav"]
-    prev_units = prev["total_units"]
-    prev_ni    = prev["net_invested"]
-    cf         = current_ni - prev_ni
-    units      = prev_units + cf / prev_nav
+    prev     = json.load(open(STATE_FILE))
+    prev_nav = prev["nav"]
+    prev_ni  = prev["net_invested"]
+    # Use sum of per-account units for accuracy; fall back to total_units
+    per_acct_units = prev.get("units", {})
+    prev_units = sum(per_acct_units.values()) if per_acct_units else prev["total_units"]
+    cf    = current_ni - prev_ni
+    units = prev_units + cf / prev_nav
     return round(current_value / units, 6)
 
 
