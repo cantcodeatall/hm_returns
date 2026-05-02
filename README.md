@@ -269,7 +269,7 @@ This file contains your historical manual snapshots — one entry per date, in t
 Net Investment: 85113.72
 P&L: 5664.24
 Final Value: 90777.96
-Total return: 16.65%
+Total return: 6.65%
 Internal rate of return (IRR): 6.73%
 ```
 
