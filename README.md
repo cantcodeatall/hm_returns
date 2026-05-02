@@ -207,7 +207,7 @@ units_t  = units_{t−1} + CF_t / NAV_{t−1}   # adjust unit count for flows
 NAV_t    = Value_t / units_t                 # pure performance, no flow distortion
 ```
 
-Starting point: **2023-01-01, NAV = 100.00**, units = NI_first / 100 = 7199.61.
+Starting point: **2023-01-01, NAV = 100.00**, units = NI_first / 100 = 519.61.
 First snapshot (2023-08-30) NAV ≈ 105.48, reflecting 8 months of performance.
 NAV between sparse snapshot dates is linearly interpolated.
 Income (interest, underwriter fees) is captured as NAV appreciation automatically — no separate transaction needed, like an accumulating fund.
@@ -248,23 +248,74 @@ Transactions are semicolon-delimited with columns:
 
 ### Setup (one-time)
 
-**1.** Place `snapshots5.txt` in the working folder (same folder as `run.py`).
+**1. Configure `pp_index.py`**
 
-**2.** Run the historical seed:
+Edit the `ACCOUNTS` dict to match your accounts, and update these two dates:
+
+```python
+STARTING_DATE = pd.Timestamp("YYYY-01-01")   # start of your investment history
+SPLIT_DATE    = pd.Timestamp("YYYY-MM-DD")   # first date per-account data appears in hm_history.csv
+```
+
+The `SPLIT_DATE` is the date when the automated scraper first ran and populated per-account values in `hm_history.csv`. Check the file to find the first row that has per-account value columns filled in.
+
+**2. Prepare `snapshots5.txt`**
+
+This file contains your historical manual snapshots — one entry per date, in this format:
+
+```
+2024-03-15
+===========
+Net Investment: 85113.72
+P&L: 5664.24
+Final Value: 90777.96
+Total return: 16.65%
+Internal rate of return (IRR): 6.73%
+```
+
+Rules:
+- Date must be on its own line in `YYYY-MM-DD` format
+- `Final Value:` or `Current Value:` must be present (used as portfolio value)
+- `Net Investment:` must be present (used for chain-linking)
+- Entries can be in any order — the file is sorted by date automatically
+- Entries between `STARTING_DATE` and `SPLIT_DATE` are used for the NAV series and pre-split IRR calibration
+- If you have no manual snapshots, a single entry on or near `STARTING_DATE` with your opening balance is sufficient
+
+Place the file in the same folder as `run.py`.
+
+**3. Run the historical seed**
+
 ```bash
 python pp_index.py
 ```
-This produces `hmfund_quotes.csv`, `hmfund_transactions_seed.csv`, `hm_pp_state.json` locally and pushes both to Google Sheets. The log shows the solved rate per account and confirms the simulated balance matches the target.
 
-**3.** In Google Sheets → File → Share → Publish to web → publish `HM_pp_quotes` and `HM_pp_transactions` as CSV. Copy the two URLs.
+This produces locally:
+- `hmfund_quotes.csv` — daily NAV price series
+- `hmfund_transactions_seed.csv` — all historical transactions
+- `hm_pp_state.json` — state for daily incremental updates
 
-**4.** In Portfolio Performance:
-- Create security `HMFUND` (ISIN `XX000HM00001`, ticker `HM`), starting price 100.00 on 2023-01-01
-- Historical prices → Add → From URL → paste `HM_pp_quotes` URL (semicolon separator, Date / Close columns)
-- Create one securities account per sub-account, using the names defined in the `ACCOUNTS` dict in `pp_index.py`
-- Import `HM_pp_transactions` as Portfolio Transactions (semicolon separator), tick Convert to Delivery
+And pushes both CSV files to Google Sheets (`HM_pp_quotes` and `HM_pp_transactions` tabs).
 
-**Going forward**, Step 7 of the daily run calls `daily_update()` automatically, appending the new NAV quote and any transactions, then rewrites both Google Sheets tabs with the full updated data.
+The log output will show the solved rate per account and confirm the simulated balance matches the target:
+```
+→ acc1_reg: rate=6.84%  simulated=£26,610.24  target=£26,610.24  error=£0.00
+→ acc1_isa: rate=7.24%  simulated=£39,346.71  target=£39,346.71  error=£0.00
+```
+
+If any account shows a large error, check that the XIRR columns in `hm_history.csv` are populated on `SPLIT_DATE`.
+
+**4. Publish Google Sheets tabs as CSV**
+
+In Google Sheets → File → Share → Publish to web → select each tab → CSV → Publish. Copy the two URLs for `HM_pp_quotes` and `HM_pp_transactions`.
+
+**5. Set up Portfolio Performance**
+
+- Create security `HMFUND` (ISIN `XX000HM00001`, ticker `HM`), starting price 100.00 on `STARTING_DATE`
+- Historical prices → Add → From URL → paste `HM_pp_quotes` URL (semicolon separator, `Date` / `Close` columns)
+- Create one securities account per sub-account, using the names defined in `ACCOUNTS` in `pp_index.py`
+- Import `HM_pp_transactions` as **Portfolio Transactions** (semicolon separator), tick **Convert to Delivery (Inbound/Outbound)**
+
+**Going forward**, Step 7 of the daily run calls `daily_update()` automatically, appending the new NAV quote and any transactions, then rewrites both Google Sheets tabs.
 
 ### Re-running the seed
 
